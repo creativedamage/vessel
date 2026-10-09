@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+/* Dark mode follows a .dark class on <html> (set before paint by the script in layout.tsx). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Brand: a calm indigo with a warm amber accent */
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-200: #c7d2fe;
+  --color-brand-400: #818cf8;
+  --color-brand-500: #6366f1;
+  --color-brand-600: #4f46e5;
+  --color-brand-700: #4338ca;
+  --color-brand-900: #312e81;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100;
+  }
+  ::selection {
+    @apply bg-brand-200 dark:bg-brand-700;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-stone-200 bg-white shadow-xs dark:border-stone-800 dark:bg-stone-900;
+  }
+  .input {
+    @apply w-full rounded-xl border border-stone-300 bg-white px-3.5 py-2.5 text-sm outline-none transition
+      placeholder:text-stone-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15
+      dark:border-stone-700 dark:bg-stone-900 dark:placeholder:text-stone-500;
+  }
+  .label {
+    @apply mb-1.5 block text-sm font-medium text-stone-700 dark:text-stone-300;
+  }
+  .tag {
+    @apply font-mono text-[0.8125rem] tracking-tight;
+  }
+}
+
+@keyframes pop {
+  0% { transform: scale(0.96); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.animate-pop {
+  animation: pop 160ms ease-out;
+}

@@ -1,0 +1,28 @@
+{
+  "name": "vessel",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Asset management for churches and non-profits",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "db:up": "docker compose up -d db",
+    "db:generate": "npm run generate -w @vessel/db",
+    "db:migrate": "npm run migrate:dev -w @vessel/db",
+    "db:deploy": "npm run migrate:deploy -w @vessel/db",
+    "db:seed": "npm run seed -w @vessel/db",
+    "db:reset": "npm run reset -w @vessel/db",
+    "dev:api": "npm run dev -w @vessel/api",
+    "dev:web": "npm run dev -w @vessel/web",
+    "dev": "npm run dev:api & npm run dev:web",
+    "test": "npm run test -w @vessel/api",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
+  }
+}

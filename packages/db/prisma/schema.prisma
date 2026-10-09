@@ -1,0 +1,538 @@
+// Vessel — asset management for churches and non-profits
+// Phase 1 schema (PostgreSQL + Prisma)
+// Every tenant-owned table carries organizationId; enforce with Postgres RLS + a Prisma client extension.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/generated/prisma"
+  moduleFormat           = "esm"
+}
+
+// Connection URL lives in prisma.config.ts (Prisma 7)
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// Tenancy & places
+// ─────────────────────────────────────────────
+
+model Organization {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  slug         String   @unique
+  timezone     String   @default("America/Chicago")
+  tagPrefix    String   @default("VSL") // printed on labels: VSL-000123
+  nextTagSeq   Int      @default(1)
+  settings     Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campuses        Campus[]
+  ministries      Ministry[]
+  people          Person[]
+  categories      Category[]
+  itemTypes       ItemType[]
+  assets          Asset[]
+  fieldDefs       CustomFieldDef[]
+  checkouts       Checkout[]
+  events          AuditEvent[]
+  devices         KioskDevice[]
+  enrollments     KioskEnrollment[]
+  identityLinks   IdentityProvider[]
+  kits            Kit[]
+  inventories     InventorySession[]
+  serviceRecords  ServiceRecord[]
+  groups          DirectoryGroup[]
+}
+
+model Campus {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  name           String   // "Main Campus", "North Campus"
+  address        String?
+  archivedAt     DateTime?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  rooms        Room[]
+  assets       Asset[]      @relation("AssetHomeCampus")
+
+  @@unique([organizationId, name])
+}
+
+/// Rooms nest: Building > Floor > Room > Closet/Shelf. kind is a label only.
+model Room {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  campusId       String   @db.Uuid
+  parentId       String?  @db.Uuid
+  name           String   // "Sanctuary", "Youth Room B", "AV Closet"
+  kind           RoomKind @default(ROOM)
+  path           String   // materialized path for fast subtree queries: "/<campus>/<bldg>/<room>"
+  qrCode         String?  @unique // rooms get a scannable label too
+  archivedAt     DateTime?
+
+  campus      Campus     @relation(fields: [campusId], references: [id])
+  parent      Room?      @relation("RoomTree", fields: [parentId], references: [id])
+  children    Room[]     @relation("RoomTree")
+  homeAssets  Asset[]    @relation("AssetHomeRoom")
+  currentAssets Asset[]  @relation("AssetCurrentRoom")
+  checkouts   Checkout[]
+
+  @@index([organizationId, campusId])
+  @@index([path])
+}
+
+enum RoomKind {
+  BUILDING
+  FLOOR
+  ROOM
+  STORAGE
+  SHELF
+}
+
+/// Ministries / entities nest: Worship > Production > Lighting.
+model Ministry {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  parentId       String?  @db.Uuid
+  name           String
+  color          String?  // UI chip colour
+  isLegalEntity  Boolean  @default(false) // e.g. a separately incorporated school or daycare
+  archivedAt     DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  parent       Ministry?    @relation("MinistryTree", fields: [parentId], references: [id])
+  children     Ministry[]   @relation("MinistryTree")
+  assets       Asset[]
+  checkouts    Checkout[]
+  leaders      MinistryMember[]
+
+  @@unique([organizationId, parentId, name])
+}
+
+// ─────────────────────────────────────────────
+// People & identity
+// ─────────────────────────────────────────────
+
+/// Staff and volunteers share one table. Volunteers usually have no SSO identity.
+model Person {
+  id             String     @id @default(uuid()) @db.Uuid
+  organizationId String     @db.Uuid
+  kind           PersonKind
+  displayName    String
+  email          String?
+  phone          String?
+  role           StaffRole? // null for volunteers
+  pinHash        String?    // scrypt; optional per-volunteer PIN for kiosk attribution
+  pinFailedCount Int        @default(0)
+  pinLockedUntil DateTime?
+  externalId     String?    // Entra objectId or Google user id
+  externalSource IdentitySource?
+  active         Boolean    @default(true)
+  lastSyncedAt   DateTime?
+  createdAt      DateTime   @default(now())
+
+  organization  Organization     @relation(fields: [organizationId], references: [id])
+  ministries    MinistryMember[]
+  groups        GroupMember[]
+  checkoutsHeld Checkout[]       @relation("CheckoutAssignee")
+  checkoutsDone Checkout[]       @relation("CheckoutActor")
+  checkinsDone  Checkout[]       @relation("CheckinActor")
+  sessions      StaffSession[]
+
+  @@unique([organizationId, email])
+  @@unique([organizationId, externalSource, externalId])
+  @@index([organizationId, displayName])
+}
+
+enum PersonKind {
+  STAFF
+  VOLUNTEER
+  CONTACT // e.g. a visiting band member who borrows gear
+}
+
+enum StaffRole {
+  OWNER       // org settings, billing, SSO config
+  ADMIN       // everything except billing
+  MANAGER     // assets/checkouts for their ministries
+  VIEWER      // read-only, reports
+}
+
+enum IdentitySource {
+  ENTRA
+  GOOGLE
+  LOCAL
+}
+
+model MinistryMember {
+  personId   String  @db.Uuid
+  ministryId String  @db.Uuid
+  isLeader   Boolean @default(false)
+
+  person   Person   @relation(fields: [personId], references: [id])
+  ministry Ministry @relation(fields: [ministryId], references: [id])
+
+  @@id([personId, ministryId])
+}
+
+/// SSO + directory sync configuration per org.
+model IdentityProvider {
+  id             String         @id @default(uuid()) @db.Uuid
+  organizationId String         @db.Uuid
+  source         IdentitySource
+  tenantOrDomain String         // Entra tenant id or Google Workspace primary domain
+  config         Json           // client ids, group→role mappings, OU filters (secrets live in a vault, not here)
+  syncEnabled    Boolean        @default(true)
+  lastSyncAt     DateTime?
+  lastSyncStatus String?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, source])
+}
+
+/// Groups / OUs mirrored from Google or Entra, mapped to roles or ministries.
+model DirectoryGroup {
+  id             String         @id @default(uuid()) @db.Uuid
+  organizationId String         @db.Uuid
+  source         IdentitySource
+  externalId     String
+  name           String
+  mapsToRole     StaffRole?
+  mapsToMinistryId String?      @db.Uuid
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  members      GroupMember[]
+
+  @@unique([organizationId, source, externalId])
+}
+
+model GroupMember {
+  groupId  String @db.Uuid
+  personId String @db.Uuid
+
+  group  DirectoryGroup @relation(fields: [groupId], references: [id])
+  person Person         @relation(fields: [personId], references: [id])
+
+  @@id([groupId, personId])
+}
+
+/// Refresh-token family for staff (web, macOS, mobile staff mode).
+model StaffSession {
+  id         String    @id @default(uuid()) @db.Uuid
+  personId   String    @db.Uuid
+  client     ClientKind
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  person Person @relation(fields: [personId], references: [id])
+}
+
+enum ClientKind {
+  WEB
+  MACOS
+  MOBILE
+}
+
+/// A phone/tablet enrolled as a volunteer kiosk. Scoped by campus/ministry.
+model KioskDevice {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  name           String    // "Kids Check-in iPad 2"
+  publicKeyJwk   Json      // ES256 public key; the device signs token requests with the private half
+  scope          Json      // { campusIds:[], ministryIds:[], actions:["checkout","checkin","lookup"] }
+  requirePin     Boolean   @default(true)
+  enrolledById   String    @db.Uuid
+  enrolledAt     DateTime  @default(now())
+  lastSeenAt     DateTime?
+  revokedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  checkouts    Checkout[]
+
+  @@index([organizationId])
+}
+
+/// One-time code an admin shows as a QR; a device redeems it to become a KioskDevice.
+model KioskEnrollment {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  codeHash       String    @unique
+  name           String
+  scope          Json
+  requirePin     Boolean   @default(true)
+  createdById    String    @db.Uuid
+  expiresAt      DateTime
+  usedAt         DateTime?
+  deviceId       String?   @db.Uuid
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+}
+
+// ─────────────────────────────────────────────
+// Catalog & custom fields
+// ─────────────────────────────────────────────
+
+model Category {
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String  @db.Uuid
+  name           String  // AV, IT, Instruments, Kitchen, Furniture, Vehicles
+  icon           String?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  itemTypes    ItemType[]
+  fieldDefs    CustomFieldDef[]
+
+  @@unique([organizationId, name])
+}
+
+/// "Shure SM58", "MacBook Air 13 M3". Consumables track quantity instead of individual tags.
+model ItemType {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  categoryId     String   @db.Uuid
+  name           String
+  manufacturer   String?
+  modelNumber    String?
+  imageUrl       String?
+  tracking       TrackingMode @default(INDIVIDUAL)
+  serviceIntervalDays Int?   // default service interval for gear of this type
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  category     Category     @relation(fields: [categoryId], references: [id])
+  assets       Asset[]
+
+  @@unique([organizationId, name])
+}
+
+enum TrackingMode {
+  INDIVIDUAL // one tag per item (mics, laptops)
+  BULK       // one tag per bin, quantity tracked (XLR cables, batteries)
+}
+
+/// Field definitions are data, not migrations.
+model CustomFieldDef {
+  id             String     @id @default(uuid()) @db.Uuid
+  organizationId String     @db.Uuid
+  categoryId     String?    @db.Uuid // null = applies to all categories
+  key            String     // stable machine key: "sunday_setup_location"
+  label          String     // "Sunday setup location"
+  type           FieldType
+  options        Json?      // for SELECT / MULTISELECT
+  required       Boolean    @default(false)
+  showOnMobile   Boolean    @default(false)
+  sortOrder      Int        @default(0)
+  archivedAt     DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  category     Category?    @relation(fields: [categoryId], references: [id])
+
+  @@unique([organizationId, key])
+}
+
+enum FieldType {
+  TEXT
+  NUMBER
+  DATE
+  BOOLEAN
+  SELECT
+  MULTISELECT
+  URL
+  ROOM_REF
+  PERSON_REF
+}
+
+// ─────────────────────────────────────────────
+// Assets & lifecycle
+// ─────────────────────────────────────────────
+
+model Asset {
+  id             String      @id @default(uuid()) @db.Uuid
+  organizationId String      @db.Uuid
+  assetTag       String      // human label printed on the sticker: VSL-000123
+  barcode        String?     // manufacturer or legacy barcode, if different
+  rfidEpc        String?     // UHF RFID EPC for macOS reader support
+  itemTypeId     String      @db.Uuid
+  name           String?     // optional nickname: "Pastor's lav mic"
+  serialNumber   String?
+  status         AssetStatus @default(AVAILABLE)
+  quantity       Int         @default(1) // >1 only for BULK item types
+  ministryId     String?     @db.Uuid    // owning ministry
+  homeCampusId   String?     @db.Uuid
+  homeRoomId     String?     @db.Uuid    // where it lives when not in use
+  currentRoomId  String?     @db.Uuid    // where it is now (set on room check-out / inventory)
+  purchaseDate   DateTime?
+  purchaseCost   Decimal?    @db.Decimal(12, 2)
+  fundSource     String?     // designated gift, grant, general fund
+  warrantyEndsAt DateTime?
+  nextServiceAt  DateTime?
+  customFields   Json        @default("{}") // { "sunday_setup_location": "Stage left", ... } validated against CustomFieldDef
+  notes          String?
+  version        Int         @default(1)   // optimistic concurrency for offline sync
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  retiredAt      DateTime?
+
+  organization  Organization    @relation(fields: [organizationId], references: [id])
+  itemType      ItemType        @relation(fields: [itemTypeId], references: [id])
+  ministry      Ministry?       @relation(fields: [ministryId], references: [id])
+  homeCampus    Campus?         @relation("AssetHomeCampus", fields: [homeCampusId], references: [id])
+  homeRoom      Room?           @relation("AssetHomeRoom", fields: [homeRoomId], references: [id])
+  currentRoom   Room?           @relation("AssetCurrentRoom", fields: [currentRoomId], references: [id])
+  checkouts     Checkout[]
+  kitItems      KitItem[]
+  serviceRecords ServiceRecord[]
+  inventoryScans InventoryScan[]
+
+  @@unique([organizationId, assetTag])
+  @@index([organizationId, barcode])
+  @@index([organizationId, rfidEpc])
+  @@index([organizationId, status])
+  @@index([organizationId, ministryId])
+}
+
+enum AssetStatus {
+  AVAILABLE
+  CHECKED_OUT
+  IN_SERVICE    // out for repair / maintenance
+  MISSING
+  RETIRED
+}
+
+/// One open checkout per INDIVIDUAL asset (enforced by a partial unique index in SQL:
+///   CREATE UNIQUE INDEX one_open_checkout ON "Checkout"("assetId") WHERE "checkedInAt" IS NULL;)
+model Checkout {
+  id             String      @id @default(uuid()) @db.Uuid
+  organizationId String      @db.Uuid
+  assetId        String      @db.Uuid
+  batchId        String      @db.Uuid    // all assets scanned in one session share a batch
+  clientOpId     String      @unique     // idempotency key from the device (UUIDv7)
+  targetType     CheckoutTarget
+  assigneeId     String?     @db.Uuid    // when targetType = PERSON
+  ministryId     String?     @db.Uuid    // when targetType = MINISTRY
+  roomId         String?     @db.Uuid    // when targetType = ROOM
+  quantity       Int         @default(1)
+  checkedOutAt   DateTime
+  dueAt          DateTime?
+  checkedOutById String?     @db.Uuid    // staff or PIN-identified volunteer
+  kioskDeviceId  String?     @db.Uuid
+  checkedInAt    DateTime?
+  checkedInById  String?     @db.Uuid
+  checkinCondition String?   // "ok", "damaged", free text
+  note           String?
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  asset        Asset         @relation(fields: [assetId], references: [id])
+  assignee     Person?       @relation("CheckoutAssignee", fields: [assigneeId], references: [id])
+  ministry     Ministry?     @relation(fields: [ministryId], references: [id])
+  room         Room?         @relation(fields: [roomId], references: [id])
+  checkedOutBy Person?       @relation("CheckoutActor", fields: [checkedOutById], references: [id])
+  checkedInBy  Person?       @relation("CheckinActor", fields: [checkedInById], references: [id])
+  kioskDevice  KioskDevice?  @relation(fields: [kioskDeviceId], references: [id])
+
+  @@index([organizationId, assetId, checkedInAt])
+  @@index([organizationId, assigneeId, checkedInAt])
+  @@index([batchId])
+}
+
+enum CheckoutTarget {
+  PERSON
+  MINISTRY
+  ROOM
+}
+
+/// Sunday setup bundles: "Kids stage pack", "Portable baptism kit".
+model Kit {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  name           String
+  qrCode         String?  @unique // scanning a kit tag expands to its assets
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  items        KitItem[]
+}
+
+model KitItem {
+  kitId   String @db.Uuid
+  assetId String @db.Uuid
+
+  kit   Kit   @relation(fields: [kitId], references: [id])
+  asset Asset @relation(fields: [assetId], references: [id])
+
+  @@id([kitId, assetId])
+}
+
+model ServiceRecord {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  assetId        String    @db.Uuid
+  kind           String    // "lamp replacement", "piano tuning", "firmware update"
+  performedAt    DateTime
+  performedBy    String?   // vendor or person name
+  cost           Decimal?  @db.Decimal(12, 2)
+  notes          String?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  asset        Asset        @relation(fields: [assetId], references: [id])
+}
+
+/// Inventory walk: scan everything in a room, diff against expected.
+model InventorySession {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  roomId         String?   @db.Uuid
+  startedById    String    @db.Uuid
+  startedAt      DateTime  @default(now())
+  closedAt       DateTime?
+
+  organization Organization    @relation(fields: [organizationId], references: [id])
+  scans        InventoryScan[]
+}
+
+model InventoryScan {
+  sessionId String   @db.Uuid
+  assetId   String   @db.Uuid
+  scannedAt DateTime @default(now())
+
+  session InventorySession @relation(fields: [sessionId], references: [id])
+  asset   Asset            @relation(fields: [assetId], references: [id])
+
+  @@id([sessionId, assetId])
+}
+
+// ─────────────────────────────────────────────
+// Audit log (append-only; revoke UPDATE/DELETE from the app role)
+// ─────────────────────────────────────────────
+
+model AuditEvent {
+  id             BigInt     @id @default(autoincrement())
+  organizationId String     @db.Uuid
+  occurredAt     DateTime   @default(now())
+  actorType      ActorType
+  actorPersonId  String?    @db.Uuid
+  kioskDeviceId  String?    @db.Uuid
+  action         String     // "asset.checkout", "asset.update", "person.sync.deactivate"
+  entityType     String     // "Asset", "Checkout", "Person"
+  entityId       String
+  batchId        String?    @db.Uuid
+  before         Json?
+  after          Json?
+  ip             String?
+  userAgent      String?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, entityType, entityId, occurredAt])
+  @@index([organizationId, occurredAt])
+}
+
+enum ActorType {
+  STAFF
+  VOLUNTEER_KIOSK
+  SYSTEM_SYNC
+  API_KEY
+}
